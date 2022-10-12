@@ -1,0 +1,719 @@
+---
+title: "Tutorial for basel amplicon analysis pipeline"
+author: '[Yincheng Chen](https://yinchengchen23.github.io/myCV/)'
+date: "Created on 09 Oct., 2022"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: cosmo
+    highlight: tango
+    df_print: kable
+---
+
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(error = TRUE)
+```
+
+
+# Data loading
+
+The fecal microbiota data which from PRJEB6070 [(Zeller et al., 2016)](https://pubmed.ncbi.nlm.nih.gov/25432777/) is used in this demonstration. 
+In total 129 samples were collected, including 41 CRC patients, 63 adenomas and 50 health control.
+
+```{r, echo = TRUE, message = FALSE, warning = FALSE, collapse=TRUE}
+library(ggplot2)
+library(ggpubr)
+library(matrixStats)
+library(phyloseq)
+library(picante)
+library(rstatix)
+library(tidyverse)
+library(vegan)
+
+setwd('~/myCRC/AmpliconR/data')
+dir()
+Data <- read.table("~/myCRC/AmpliconR/data/ASV_table.txt", sep = "\t", stringsAsFactors = F)
+Meta <- read.table("~/myCRC/AmpliconR/data/metadata.txt", sep = "\t", stringsAsFactors = F)
+Taxa <- read.table("~/myCRC/AmpliconR/data/taxa_table.txt", sep = "\t", stringsAsFactors = F)
+Data <- Data[,rownames(Meta)]
+```
+
+The 6661 ASVs was identified in this demonstration. The Row is indicating ASVs, the column is show the sample
+
+```{r, echo = FALSE, layout = "l-body-outset"}
+head(Data[,1:6])
+head(Taxa)
+head(Meta)
+```
+
+<br/>
+
+### Phylogenetic tree building
+
+Since 16S ribosomal sequences contained the non-coding sequence and secondary structure, the alignment method was considered.
+We suggest to use [ssu-align](http://eddylab.org/software/ssu-align/) to do alignment for phylogenetic inference. The detailed process is as follows.
+
+```{r, eval=FALSE}
+$ cd ~/myCRC/AmpliconR/data
+$ ssu-align ASV.fasta ssuout
+$ cd ssuout
+```
+
+The alignment result is generated in `ssuout/ssuout.bacteria.stk`, we can transfer the stk to fasta format by following process.
+
+```{r, eval=FALSE}
+setwd('~/myCRC/AmpliconR/data/ssuout')
+fileName = "ssuout.bacteria.stk"
+con=file(fileName,open="r")
+line=readLines(con)
+close(con)
+stk <- data.frame()
+stk[1,1:2] <- 0
+colnames(stk) <- c("ID","seq")
+count <- 1
+for(i in 1:length(line)){
+  if(line[i] == ""){next}
+  if(substr(line[i],1,3) == "ASV"){
+    word <- strsplit(line[i],split=" ",fixed=T)[[1]]
+    for(j in 1:length(word)){
+      if(substr(word[j],1,3) == "ASV"){
+        stk[count,1] <-  word[j]
+      }
+      if(substr(word[j],1,1) == "-"){
+        stk[count,2] <-  word[j]
+        count <- count + 1
+      }
+    }
+  }
+}
+
+fileConn<-  file("ssu_align.fasta")
+for(i in c(1:dim(stk)[1])){
+  word <- gsub("\\.", replacement="-", stk[i,2])
+  word <- gsub("U", replacement="T", word)         
+  write(paste0(">",stk[i,1]),file="ssu_align.fasta",append=TRUE)
+  write(word, file="ssu_align.fasta", append=TRUE)
+}
+close(fileConn)
+```
+
+In order to shorten the processing time, we use the [FastTree](http://www.microbesonline.org/fasttree/) for maximum-likelihood phylogenetic tree completion. If time is available, [RAxML](https://cme.h-its.org/exelixis/web/software/raxml/) is suggested to get the better quality tree.
+
+```{r, eval=FALSE}
+$ cd ~/myCRC/AmpliconR/data
+$ ~/bin/fastree -gtr -nt ssuout/ssu_align.fasta > ASV.tree
+```
+<br/>
+<br/>
+
+#  Alpha diversity
+
+Alpha diversity describes the species diversity within a community.
+
+### Rarefaction normalization
+
+Since various range of sequencing depth in data, we usually conduct the rarefaction normalization to 'fairly' compare the diversity metrics.
+
+```{r, message = FALSE, warning = FALSE}
+# Rarefaction curve
+ASV = otu_table(Data, taxa_are_rows = TRUE)
+TAX = tax_table(as.matrix(Taxa))
+physeq = phyloseq(ASV, TAX)
+sampledata = sample_data(Meta)
+physeq = merge_phyloseq(physeq, sampledata)
+source("~/myCRC/AmpliconR/ggrare.R")
+
+min_depth <- min(colSums(Data))
+
+ggrare(physeq, step = 1500, colour = "class", se = FALSE) +
+  scale_colour_brewer(palette="Set1") +
+  geom_vline(xintercept = min_depth, linetype = 'dotdash') + 
+  theme(axis.line = element_line(linetype = 1,colour = 'black'),
+  panel.background = element_rect(I(0)),
+  panel.grid.major = element_line(colour = NA),
+  panel.grid.minor = element_line(colour = NA))
+```
+
+<br/>
+
+The upper picture show the library size vs. number of observed species, in rarefaction process, we limited the all samples in minimum depth **(black dotdash)**, and then randomly discarding reads from larger samples until the number of remaining samples is equal to this threshold
+
+```{r, collapse=TRUE}
+# Rarefaction
+print(colSums(Data)[1:16])
+min <- min(colSums(Data))
+Data_rarefied <- t(rrarefy(t(Data), min))
+Data_rarefied <- Data_rarefied[rowSums(Data_rarefied) > 0,]
+print(colSums(Data_rarefied)[1:16])
+```
+
+<br/>
+
+After rarefaction, All the sample size are equality, we can calculate the various alpha index to each sample.
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE}
+tree <- read.tree("~/myCRC/AmpliconR/data/ASV.tree")
+a <- cophenetic(tree)     #check the root by farthest phylogenetic distance ASV
+rowSums(a)[order(rowSums(a), decreasing = T )][1:8]
+tree <- root(tree, "ASV04650", resolve.root = T)
+
+AlphaIndex <- data.frame(Shannon = diversity(t(Data_rarefied) ,index  = "shannon"),
+                         Chao1 = estimateR(t(Data_rarefied))[2,],
+                         Simpson = diversity(t(Data_rarefied) ,index  = "simpson"),
+                         invSimpson = diversity(t(Data_rarefied) ,index  = "invsimpson"),
+                         PD = pd(t(Data_rarefied), tree)[,1],
+                         group = Meta$class)
+```
+
+<br/>
+
+### Shannon diversity
+
+$$ H_{sw} = - \sum_{i = 1}^{s} (\frac{n_i}{N}) \ln(\frac{n_i}{N}) $$
+
+[Shannon and Wiener (1963)](https://monoskop.org/images/b/be/Shannon_Claude_E_Weaver_Warren_The_Mathematical_Theory_of_Communication_1963.pdf) is base on information theory, $N$ is total number of individual, and $n_i$ is the number of individual belong in species $i$. The more the number of species and the more evenly distributed the individuals are, the higher the index it get. Therefore, $H_{sw}$ can be regarded as `equitability`.
+
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, out.height='70%', out.width='70%'}
+pwc <- wilcox_test(Shannon ~ group, paired = F, p.adjust.method = "None", data = AlphaIndex)
+pwc <- pwc %>% add_xy_position(x = "group")
+ggboxplot(AlphaIndex, x = "group", y = "Shannon", add = "point", fill = "group") +
+  scale_fill_brewer(palette = "Set1") + ylab("Shannon index") +
+  stat_pvalue_manual(pwc, hide.ns = TRUE) +
+  labs(caption = get_pwc_label(pwc))
+```
+
+<br/>
+
+### Chao1 richness
+
+$$ S = S_{obs} + \frac{F^2_1}{2F_2} $$
+In Chao1 estimator [(Chao, A. 1984)](https://www.researchgate.net/publication/268975118_Non-parametric_estimation_of_the_classes_in_a_population). $S_{obs}$ is indicated the number of observed species, $F_1$ is the number of species which only once. and $F_2$ is the number of species which twice in community. Higher $F_1$ indicates that the number of non-observed species is likely to be higher. It is expected that the community will have a relatively high abundance of species. but $F_2$ show the species have occurred at least twice, then the chance of new species occurring in the community is low.
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, out.height='70%', out.width='70%'}
+pwc <- wilcox_test(Chao1 ~ group, paired = F, p.adjust.method = "None", data = AlphaIndex)
+pwc <- pwc %>% add_xy_position(x = "group")
+ggboxplot(AlphaIndex, x = "group", y = "Chao1", add = "point", fill = "group") +
+  scale_fill_brewer(palette = "Set1") + ylab("Chao1 richness") +
+  stat_pvalue_manual(pwc, hide.ns = TRUE) +
+  labs(caption = get_pwc_label(pwc))
+
+```
+
+<br/>
+
+### Simpson index
+
+$$ D_s = \sum_{i = 1}^{s} (\frac{n_i}{N})^2  \ ;\ \  D_{s^\prime	}  =  \frac{1}{D_s} $$
+
+[Simpson (1949)](https://www.nature.com/articles/163688a0) is measure the dominance in single community. if some species is dominant in community, the Simpson will be higher. so it can be regarded as `concentration index`. In other words, the inverse Simpson index is show the `evenness` in community.
+
+
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, out.height='70%', out.width='70%'}
+pwc <- wilcox_test(Simpson ~ group, paired = F, p.adjust.method = "None", data = AlphaIndex)
+pwc <- pwc %>% add_xy_position(x = "group")
+ggboxplot(AlphaIndex, x = "group", y = "Simpson", add = "point", fill = "group") +
+  scale_fill_brewer(palette = "Set1") + ylab("Simpson index") +
+  stat_pvalue_manual(pwc, hide.ns = TRUE) +
+  labs(caption = get_pwc_label(pwc))
+```
+
+<br/>
+
+### Phylogenetic diversity
+
+
+Faith's Phylogenetic Diversity [(Faith D., 1992)]( https://www.sciencedirect.com/science/article/abs/pii/0006320792912013) which is defined as the sum of the branch lengths of a phylogenetic tree connecting all species, this means that PD indicates `Feature diversity`.
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, out.height='70%', out.width='70%'}
+pwc <- wilcox_test(PD ~ group, paired = F, p.adjust.method = "None", data = AlphaIndex)
+pwc <- pwc %>% add_xy_position(x = "group")
+ggboxplot(AlphaIndex, x = "group", y = "PD", add = "point", fill = "group") +
+  scale_fill_brewer(palette = "Set1") + ylab("Faith’s phylogenetic diversity") +
+  stat_pvalue_manual(pwc, hide.ns = TRUE) +
+  labs(caption = get_pwc_label(pwc))
+```
+
+<br/>
+<br/>
+
+#  Beta diversity
+
+Beta diversity describes the species diversity between two communities or ecosystems. It is looks to compare the species diversity between two separate entities, which usually be described in pair-wide distance matrix.
+
+### Bray-Curtis distance
+
+$$ D_{BC} = \frac{\sum_{i=1}^S{|M_{i1} - M_{i2}|}}{\sum_{i=1}^S{M_{i1} + M_{i2}}} $$
+
+In [Bray-Curtis](https://esajournals.onlinelibrary.wiley.com/doi/10.2307/1942268) distance, $S$ is indicates the total number of species in two communities, $M_{i1}$ is means the number of species $i$ in community 1, and so on. This method is similar to Sørensen index. and usually utilizes non-metric multidimensional scaling [nMDS](https://strata.uga.edu/software/pdf/mdsTutorial.pdf) for dimension reduction.
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, out.height='70%', out.width='70%'}
+NMDS=metaMDS(t(Data_rarefied), distance = "bray")
+NMDSplot <- as.data.frame(NMDS$points)
+NMDSplot$group <- Meta$class
+prop <- cmdscale(vegdist(t(Data_rarefied), method = "bray"), k = 2, eig = T, add = T )
+prop <- round(prop$eig*100/sum(prop$eig),1)
+print(prop[1:8]) # chick the proportion of variance explained
+stressplot(NMDS) # chick the fitness in nMDS
+ggscatter(NMDSplot, x = "MDS1", y = "MDS2",combine  = T, color = 'group',
+          ellipse.type = "norm", ellipse = T,ellipse.level = 0.5, ellipse.alpha = 0.5, repel = TRUE) +
+          scale_color_manual(values = c("#FFAA33","#77FF00"))+
+          scale_fill_manual(values = c("#FFAA33","#77FF00")) +
+          xlab(paste0(c('PC1 (', prop[1],'% var.explained)'), collapse = "")) + 
+          ylab(paste0(c('PC1 (', prop[2],'% var.explained)'), collapse = "")) +
+          theme(panel.background = element_rect(fill = 'transparent'),
+                panel.grid = element_blank(),
+                axis.ticks.length = unit(0.4,"lines"),
+                axis.ticks = element_line(color='black'),
+                axis.line = element_line(colour = "black"),
+                legend.title=element_blank(),
+                legend.position  = 'right')
+```
+
+Ellipse type can choose the `convex`, `confidence`, `t`, `euclid`.
+
+<br/>
+
+### Unifrac distance
+
+#### unweighted 
+
+$$ U_{uw} = \frac{\sum_{i=1}^N{l_i|A_{i} - B_{i}|}}{\sum_{i=1}^N{ max(A_{i} + B_{i})}} $$
+
+#### weighted 
+$$ U_{w} = \frac{\sum_{i=1}^n{b_i| \frac{A_{i}}{A_T} - \frac{B_{i}}{B_T}|}}{\sum_{j=1}^S{L_j}} $$
+
+
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, out.height='70%', out.width='70%'}
+ASV = otu_table(Data_rarefied, taxa_are_rows = TRUE)
+TAX = tax_table(as.matrix(Taxa))
+physeq = phyloseq(ASV, TAX, tree)
+Unif = UniFrac(physeq, weighted = F, normalized = F, parallel = F)  # if weighted = TRUE; then weighted UniFrac
+Unif_d <- pcoa(Unif)
+Unifplot <- data.frame(axis1 = as.numeric(Unif_d$vectors[,1]),
+                       axis2 = as.numeric(Unif_d$vectors[,2]))
+Unifplot$group <- Meta$class
+prop <- cmdscale(Unif, k = 2, eig = T, add = T)
+prop <- round(prop$eig*100/sum(prop$eig),1)
+print(prop[1:8]) # chick the proportion of variance explained
+
+ggscatter(Unifplot, x = "axis1", y = "axis2",combine = T, color = 'group',
+          ellipse.type = "norm", ellipse = T,ellipse.level = 0.5, ellipse.alpha = 0.5, repel = TRUE) +
+          scale_color_manual(values = c("#FFAA33","#77FF00"))+
+          scale_fill_manual(values = c("#FFAA33","#77FF00")) +
+          xlab(paste0(c('PC1 (', prop[1],'% var.explained)'), collapse = "")) + 
+          ylab(paste0(c('PC1 (', prop[2],'% var.explained)'), collapse = "")) +
+          theme(panel.background = element_rect(fill = 'transparent'),
+                panel.grid = element_blank(),
+                axis.ticks.length = unit(0.4,"lines"),
+                axis.ticks = element_line(color='black'),
+                axis.line = element_line(colour = "black"),
+                legend.title=element_blank(),
+                legend.position  = 'right')
+```
+
+<br/>
+
+### ANOSIM 
+
+Analysis of similarities `(ANOSIM)` is a non-parametric statistical test widely used in the field of ecology. As an ANOVA-like test, where instead of operating on raw data, operates on a ranked dissimilarity matrix.
+
+Given a matrix of rank dissimilarities between a set of samples, each solely belong to one treatment group, the ANOSIM tests whether we can reject the null hypothesis that the similarity between groups is greater than or equal to the similarity within the groups.
+
+The test statistic R is calculated in the following way:
+
+$$ R={\frac {\bar{r_{B}}-\bar{r_{W}}}{M/2}} $$
+
+where $\bar{r_{B}}$ is the average of rank similarities of pairs of samples (or replicates) originating from different sites, $\bar{r_W}$ is the average of rank similarity of pairs among replicates within sites, and $M$ = n(n − 1)/2 where n is the number of samples.
+
+
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE}
+#anosim(vegdist(t(Data_rarefied), method = "bray"), Meta$class)
+anosim(Unif, Meta$class)
+```
+
+<br/>
+
+### adonis2
+
+Permutational Multivariate Analysis of Variance `(adonis)`, 
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE}
+#adonis2(t(Data_rarefied) ~ class, data = Meta, method= "bray")
+adonis2(Unif ~ class, data = Meta, method= "bray")
+```
+
+
+<br/>
+<br/>
+
+
+# Community Composition
+
+#### Profile of microbiome
+
+sort by major species decrease
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, fig.width=18, fig.height=5}
+get_composition <- function(data, taxa, level, metadata, grouping){
+  for(i in 1:ncol(data)){
+    data[,i] <- data[,i]/colSums(data)[i]*100
+  }
+  
+  uniqtaxa <- unique(taxa[,level])
+  taxaRA <- c()
+  for(i in 1:length(uniqtaxa)){
+    taxaRA <- c(taxaRA, sum(Data[rownames(taxa)[taxa[,level] == uniqtaxa[i]],]))
+  }
+  names(taxaRA) <- uniqtaxa
+  sort_list <- sort(taxaRA, decreasing = T)
+  sort_list <- sort_list[!names(sort_list) %in% c("unidentified","uncultured")]
+  sort_list <- names(sort_list[1:10])
+  compair <- data.frame()
+  compair[1,1:4] <- 0
+  colnames(compair) <- c("sample","taxa","percentage","group")
+  count <- 1
+  for(i in 1:ncol(data)){
+    for(x in sort_list){
+      compair[count, 1] <- colnames(data)[i]
+      compair[count, 2] <- x
+      compair[count, 3] <- sum(data[rownames(taxa)[taxa[,level] == x],i])
+      compair[count, 4] <- metadata[i, grouping]
+      count <- count + 1
+    }
+    compair[count, 1] <- colnames(Data)[i]
+    compair[count, 2] <- "Others"
+    compair[count, 3] <- sum(data[rownames(taxa)[!taxa[,level] %in% sort_list],i])
+    compair[count, 4] <- metadata[i, grouping]
+    count <- count + 1
+  }
+  compair$taxa <- factor(compair$taxa, levels = c(sort_list,"Others"))
+  sorder <- compair[compair$taxa == sort_list[1],]
+  sorder <- sorder$sample[order(sorder$percentage, decreasing = T)]
+  compair$sample <- factor(compair$sample, levels = sorder)
+  return(compair)
+}
+print(colnames(Taxa))
+compair <- get_composition(Data, Taxa, 'Order', Meta, 'class') # choose the taxonomic rank for visualization
+ggplot(compair, aes(x = sample, y = percentage, fill = taxa)) + 
+  geom_bar(stat="identity",colour = "black") + scale_fill_brewer(palette = "Paired") +
+  labs(fill = "Order") + ylab("Relative abundance (%)") + 
+  #facet_grid(~group, space="free", scales="free") + # separate the group
+  theme(axis.text.x = element_blank(),
+        axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA),
+        text = element_text(size=16))
+```
+
+<br/>
+
+sort by hierarchical clustering
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, fig.width=18, fig.height=5}
+compair_2D <- reshape(compair[,1:3], idvar = "sample", timevar = "taxa", direction = "wide")
+rownames(compair_2D) <- compair_2D[,1]
+compair_2D <- compair_2D[,2:ncol(compair_2D)]
+horder <- hclust(dist(compair_2D), method = 'ward.D')
+horder <- horder$labels[horder$order]
+compair$sample <- factor(compair$sample, levels = horder)
+ggplot(compair, aes(x = sample, y = percentage, fill = taxa)) + 
+  geom_bar(stat="identity",colour = "black") + scale_fill_brewer(palette = "Paired") +
+  labs(fill = "Order") + ylab("Relative abundance (%)") + 
+  #facet_grid(~group, space="free", scales="free") + # separate the group
+  theme(axis.text.x = element_blank(),
+        axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA),
+        text = element_text(size=16))
+```
+
+<br/>
+<br/>
+
+# Differental Taxa
+
+### **Adapted LASSO**
+
+Coming soon!
+
+<br/>
+
+### ALDEx2
+
+[ALDEx2](https://microbiomejournal.biomedcentral.com/articles/10.1186/2049-2618-2-15) which generated Monte Carlo samples of Dirichlet distributions for each sample, using a uniform prior, performed CLR transformation of each realization, and then performed Wilcoxon tests on the transformed realizations.
+ 
+```{r, collapse=TRUE, message = TRUE, warning = FALSE, eval=T}
+library(ALDEx2)
+ALDEx2_result <- aldex(reads=Data, conditions = Meta$class,
+                       mc.samples = 128, test="t", effect=TRUE,
+                       include.sample.summary = FALSE, verbose=T, denom="all")
+
+selected_result <- ALDEx2_result[ALDEx2_result$wi.ep < 0.05,]
+selected_result <- cbind(rownames(selected_result),selected_result)
+head(selected_result)
+#write.table(selected_result, "~/myCRC/AmpliconR/data/Statistics/ALDEx2.txt", quote=FALSE, sep="\t", col.names = F, row.names = F)
+```
+
+<br/>
+
+### ANCOM
+
+[ANCOM](https://www.frontiersin.org/articles/10.3389/fmicb.2017.02114/full) first examined the abundance table to identify `outlier zeros` and `structural zeros`, Outlier zeros, identified by finding outliers in the distribution of taxon counts within each sample grouping, were ignored during differential abundance analysis, and replaced with NA. Structural zeros, taxa that were absent in one grouping but present in the other, were ignored during data analysis and automatically called as differentially abundant. Using the main function ANCOM, all additive log-ratios for each taxon were then tested for significance using Wilcoxon rank-sum tests, and p-values were FDR-corrected using the BH method. ANCOM-II then applied a detection threshold as described in the [original paper](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4450248/), whereby a taxon was called as DA if the number of corrected p-values reaching nominal significance for that taxon was greater than 60% of the maximum possible number of significant comparisons.
+
+```{r, collapse=TRUE, message = TRUE, warning = FALSE, eval=T}
+library(exactRankTests)
+library(nlme)
+library(dplyr)
+library(compositions)
+source('~/myCRC/AmpliconR/ancom_v2.1.R')
+
+Meta$Sample <- rownames(Meta)
+prepro <- feature_table_pre_process(feature_table = Data, meta_data = Meta,
+                                    sample_var = 'Sample', group_var = 'class',
+                                    out_cut = 0.05, zero_cut = 0.90,
+                                    lib_cut = 1000, neg_lb=FALSE)
+feature_table <- prepro$feature_table
+metadata <- prepro$meta_data
+struc_zero <- prepro$structure_zeros
+main_var <- 'class'
+p_adj_method = "BH"
+alpha=0.05
+adj_formula=NULL
+rand_formula=NULL
+ANCOM_result <- ANCOM(feature_table = feature_table, meta_data = metadata,
+             struc_zero = struc_zero, main_var = main_var, p_adj_method = p_adj_method,
+             alpha=alpha, adj_formula = adj_formula, rand_formula = rand_formula)
+ANCOM_result <- ANCOM_result$out
+ANCOM_result <- ANCOM_result[ANCOM_result$W != 0, ]
+head(ANCOM_result)
+#write.table(out, "~/myCRC/AmpliconR/data/Statistics/ANCOM.txt", quote=FALSE, sep="\t", col.names = F, row.names = F)
+
+ANCOM_selected <- ANCOM_result[ANCOM_result$detected_0.6, ]
+head(ANCOM_selected)
+#write.table(out, "~/myCRC/AmpliconR/data/Statistics/ANCOM_thr.txt", quote=FALSE, sep="\t", col.names = F, row.names = F)
+```
+
+<br/>
+
+### edgeR
+
+We added a pseudocount of 1 to the data and used the function `calcNormFactors` from the [edgeR](https://genomebiology.biomedcentral.com/articles/10.1186/gb-2010-11-3-r25) to compute relative log expression normalization factors. Negative binomial dispersion parameters were then estimated using the functions `estimateCommonDisp` followed by `estimateTagwiseDisp` to shrink feature-wise dispersion estimates through an empirical Bayes approach. We then used the `exactTest` for negative binomial data to identify features that differ between the specified groups. The resulting p-values were then corrected for multiple testing with the BH method with the function `topTags`.
+
+```{r, collapse=TRUE, message = TRUE, warning = FALSE, eval=T}
+library(edgeR)
+phyloseq_to_edgeR = function(physeq, group, method="RLE", ...){
+  if( !taxa_are_rows(physeq) ){ physeq <- t(physeq) }
+  x = as(otu_table(physeq), "matrix")
+  # Add one to protect against overflow, log(0) issues.
+  x = x + 1
+  # Check `group` argument
+  if( identical(all.equal(length(group), 1), TRUE) & nsamples(physeq) > 1 ){
+    # Assume that group was a sample variable name (must be categorical)
+    group = get_variable(physeq, group)
+  }
+  # Define gene annotations (`genes`) as tax_table
+  taxonomy = tax_table(physeq, errorIfNULL=FALSE)
+  if( !is.null(taxonomy) ){
+    taxonomy = data.frame(as(taxonomy, "matrix"))
+  } 
+  # Now turn into a DGEList
+  y = DGEList(counts=x, group=group, genes=taxonomy, remove.zeros = TRUE, ...)
+  # Calculate the normalization factors
+  z = calcNormFactors(y, method=method)
+  # Check for division by zero inside `calcNormFactors`
+  if( !all(is.finite(z$samples$norm.factors)) ){
+    stop("Something wrong with edgeR::calcNormFactors on this data,
+         non-finite $norm.factors, consider changing `method` argument")
+  }
+  # Estimate dispersions
+  return(estimateTagwiseDisp(estimateCommonDisp(z)))
+}
+ASV <- phyloseq::otu_table(Data, taxa_are_rows = T)
+sampledata <- phyloseq::sample_data(Meta, errorIfNULL = T)
+phylo <- phyloseq::merge_phyloseq(ASV, sampledata)
+test <- phyloseq_to_edgeR(physeq = phylo, group = "class")
+et = exactTest(test)
+out = topTags(et, n=nrow(test$table), adjust.method="BH", sort.by="PValue")
+edgeR_result <- out@.Data[[1]]
+edgeR_selected <- edgeR_result[edgeR_result$FDR < 0.05,]
+edgeR_selected <- cbind(rownames(edgeR_selected), edgeR_selected)
+head(edgeR_selected)
+# write.table(subout, "~/myCRC/AmpliconR/data/Statistics/edgeR.txt", quote=FALSE, sep="\t", col.names = F, row.names = F)
+```
+
+<br/>
+
+### LEfSe
+
+[LEfSe](https://pubmed.ncbi.nlm.nih.gov/21702898/) performed a Kruskal-Wallis (which in our two-group case reduces to the Wilcoxon rank-sum) hypothesis test to identify potential differentially abundant features, followed by linear discriminant analysis (LDA) of class labels on abundances to estimate the effect sizes for significant features. From these, only those features with scaled LDA analysis scores above the threshold score of 2.0 (default) were called as differentially abundant.
+
+```{r, collapse=TRUE, message = TRUE, warning = FALSE, eval=T}
+# file preparation
+flip_ASV_table <- data.frame(t(Data), check.names = F)
+flip_ASV_table <- cbind(Meta$class, flip_ASV_table)
+colnames(flip_ASV_table)[1] <- "class"
+flip_ASV_table <- cbind(rownames(Meta), flip_ASV_table)
+colnames(flip_ASV_table)[1] <- "id"
+ret_tab <- data.frame(t(flip_ASV_table), check.names = F)
+head(ret_tab)
+#write.table(ret_tab, "~/myCRC/AmpliconR/data/Statistics/tmp_in.txt", quote=FALSE, sep="\t", col.names = F)
+```
+
+```{r, eval=F}
+# LEfSe execution by docker
+$ docker run -it --rm -v /home/yincheng23/myCRC/AmpliconR/data/Statistics:/tmp yincheng23/lefse:0.0.4
+$ format_input.py /tmp/tmp_in.txt /tmp/data_in -c 2 -u 1 -o 1000000
+$ run_lefse.py /tmp/data_in /tmp/LEfSe_res.txt
+$ plot_res.py /tmp/LEfSe_res.txt /tmp/LEfSe_res.png --dpi 300
+$ plot_cladogram.py /tmp/LEfSe_res.txt /tmp/cladogram.png --format png --dpi 300
+$ cat LEfSe_res.txt | awk '{if($3>2){print $0}}' > LEfSe_res_selected.txt  # filtering by |LDA| > 2 and p < 0.05
+```
+
+<br/>
+
+### Basal feature visualization
+
+we use edgeR to demonstrate the several plots.
+
+```{r, collapse=TRUE, message = FALSE, warning = FALSE, eval=T, fig.width=5, fig.height=3}
+library(edgeR)
+phyloseq_to_edgeR = function(physeq, group, method="RLE", ...){
+  if( !taxa_are_rows(physeq) ){ physeq <- t(physeq) }
+  x = as(otu_table(physeq), "matrix")
+  x = x + 1
+  if( identical(all.equal(length(group), 1), TRUE) & nsamples(physeq) > 1 ){
+    group = get_variable(physeq, group)
+  }
+  taxonomy = tax_table(physeq, errorIfNULL=FALSE)
+  if( !is.null(taxonomy) ){
+    taxonomy = data.frame(as(taxonomy, "matrix"))
+  } 
+  y = DGEList(counts=x, group=group, genes=taxonomy, remove.zeros = TRUE, ...)
+  z = calcNormFactors(y, method=method)
+  return(estimateTagwiseDisp(estimateCommonDisp(z)))
+}
+ASV <- phyloseq::otu_table(Data, taxa_are_rows = T)
+sampledata <- phyloseq::sample_data(Meta, errorIfNULL = T)
+phylo <- phyloseq::merge_phyloseq(ASV, sampledata)
+test <- phyloseq_to_edgeR(physeq = phylo, group = "class")
+et = exactTest(test)
+out = topTags(et, n=nrow(test$table), adjust.method="BH", sort.by="PValue")
+edgeR_result <- out@.Data[[1]]
+edgeR_selected <- edgeR_result[edgeR_result$FDR < 0.05,]
+
+et = exactTest(test)
+et = et$table
+et$select <- "drop"
+et$select[rownames(et) %in% rownames(edgeR_selected)] = "selected"
+
+Data_freq <- Data
+for(i in 1:ncol(Data_freq)){
+  Data_freq[,i] <- Data_freq[,i]/colSums(Data_freq)[i]
+}
+
+
+get_pvl <- function(m){
+  m_ <- m
+  m_[m_ > 0] = 1
+  m_ <- as.matrix(m_)
+  return(as.numeric(rowSums(m_)/ncol(m_)))
+}
+
+variance <- c()
+for(i in 1:nrow(Data_freq)){
+  variance <- c(variance, log(sd(Data_freq[i,])**2))
+}
+
+et$variation <- variance
+et$prevalence <- get_pvl(Data)
+et$neglog2p <- -log(et$PValue,2)
+et$select <- factor(et$select, levels = c('selected','drop'))
+
+ggplot(et, aes(x = logFC, y = neglog2p, color = select)) + geom_point() +
+  xlab('log(FC) Cancer vs. Normal') + ylab('-log2(p value)') + 
+  scale_color_brewer(palette = 'Set1') + theme(axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA))
+ggplot(et, aes(x = logCPM, y = logFC, color = select)) + geom_point() +
+  xlab('Relative abundance (logCPM)') + ylab('log(FC) Cancer vs. Normal') + 
+  scale_color_brewer(palette = 'Set1') +
+  theme(axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA))
+ggplot(et, aes(x = prevalence, y = logFC, color = select)) + geom_point() +
+  xlab('Prevalence') + ylab('log(FC) Cancer vs. Normal') + 
+  scale_color_brewer(palette = 'Set1') +
+  theme(axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA))
+ggplot(et, aes(x = prevalence, y = logCPM, color = select)) + geom_point() +
+  xlab('Prevalence') + ylab('Relative abundance (logCPM)') + 
+  scale_color_brewer(palette = 'Set1') +
+  theme(axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA))
+ggplot(et, aes(x = logCPM, y = variance, color = select)) + geom_point() +
+  xlab('Relative abundance (logCPM)') + ylab('log(variance)') + 
+  scale_color_brewer(palette = 'Set1') +
+  theme(axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA))
+ggplot(et, aes(x = prevalence, y = variance, color = select)) + geom_point() +
+  xlab('Prevalence') + ylab('log(variance)') +
+  scale_color_brewer(palette = 'Set1') +
+  theme(axis.line = element_line(linetype = 1,colour = 'black'),
+        panel.background = element_rect(I(0)),
+        panel.grid.major = element_line(colour = NA),
+        panel.grid.minor = element_line(colour = NA))
+```
+
+<br/>
+<br/>
+
+# Environmental Analysis
+
+To demonstrate how the environmental factor impacting in microbiota, we use wetland microbiota which characterised by ions concentration. the soil samples were collected from 4 wetland in southern Taiwan and named as AA, BB, CC, DD respectively. and each sample had be measured with LCMS.
+
+```{r, echo = TRUE, message = FALSE, warning = FALSE, collapse=TRUE}
+wetland <- read.table("~/myCRC/AmpliconR/data/wetland/ASV_table.txt", sep = "\t", stringsAsFactors = F)
+ion <- read.table("~/myCRC/AmpliconR/data/wetland/ion.txt", sep = "\t", stringsAsFactors = F)
+wetland <- wetland[,rownames(ion)]
+head(wetland[,1:5])
+head(ion)
+```
+
+
+```{r, echo = TRUE, message = FALSE, warning = FALSE, collapse=TRUE}
+min <- min(colSums(wetland))
+wetland_rarefied <- t(rrarefy(t(wetland), min))
+wetland_rarefied <- wetland_rarefied[rowSums(wetland_rarefied) > 0,]
+
+manteldf <- data.frame(Factor = 0, rho = 0, p_value = 0)
+count <- 1
+for(i in 1:ncol(ion)){
+  Mantel_res <- mantel(dist(ion[,i]),vegdist(t(wetland_rarefied)), method = "spearman")
+  manteldf[count,1] <- colnames(ion)[i]
+  manteldf[count,2] <- round(Mantel_res$statistic,4)
+  manteldf[count,3] <- round(Mantel_res$signif,4)
+  count = count + 1
+}
+manteldf
+```
+
+
+
+
+# Functional prediction
